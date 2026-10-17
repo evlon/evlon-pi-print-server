@@ -550,6 +550,48 @@ install_queue() {
 }
 
 # ---------------------------------------------------------------------------
+# mDNS / Avahi
+# ---------------------------------------------------------------------------
+# Docker bridges are not on the real LAN, but Avahi happily publishes the
+# printer on them anyway. Worse, it can answer the mDNS query for
+# "<host>.local" with the *docker* bridge address - typically 172.17.0.1 -
+# which no phone can reach. Discovery then fails quietly: the printer is
+# reachable at its real address, the phone simply never finds it.
+#
+# Excluding the bridges fixes both halves of that.
+configure_avahi() {
+  local conf="/etc/avahi/avahi-daemon.conf"
+  if [[ ! -f "$conf" ]]; then
+    warn "$conf not found - skipping mDNS interface tuning"
+    return 0
+  fi
+
+  local deny="" i
+  for i in $(ls /sys/class/net 2>/dev/null); do
+    case "$i" in
+      docker*|br-*|veth*) deny="${deny:+$deny,}$i" ;;
+    esac
+  done
+
+  if [[ -z "$deny" ]]; then
+    ok "no docker bridge interfaces to exclude from mDNS"
+  elif grep -q '^deny-interfaces=' "$conf"; then
+    ok "avahi deny-interfaces already set: $(grep '^deny-interfaces=' "$conf" | cut -d= -f2)"
+  else
+    log "Excluding docker bridges from mDNS: $deny"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf '  [dry-run] add deny-interfaces=%s to %s\n' "$deny" "$conf"
+    else
+      cp -a "$conf" "$conf.bak.$(date +%Y%m%d-%H%M%S)"
+      sed -i "/^\[server\]/a deny-interfaces=${deny}" "$conf"
+    fi
+    ok "avahi will no longer advertise on docker bridges"
+  fi
+
+  run_soft systemctl restart avahi-daemon
+}
+
+# ---------------------------------------------------------------------------
 # services / boot persistence
 # ---------------------------------------------------------------------------
 enable_services() {
@@ -885,6 +927,21 @@ verify_install() {
 
   verify_pipeline || fail=1
 
+  # A printer that resolves to a docker bridge address is undiscoverable no
+  # matter how healthy everything else looks, so check it explicitly.
+  if command -v avahi-resolve >/dev/null 2>&1; then
+    local resolved
+    resolved="$(timeout 10 avahi-resolve -n "$(hostname).local" 2>/dev/null | awk '{print $2}' | head -1)"
+    if [[ -z "$resolved" ]]; then
+      warn "could not resolve $(hostname).local over mDNS yet"
+    elif [[ "$resolved" == 172.1[6-9].* || "$resolved" == 172.2[0-9].* || "$resolved" == 172.3[01].* ]]; then
+      warn "$(hostname).local resolves to $resolved (a docker bridge) - phones will not find the printer"
+      fail=1
+    else
+      ok "mDNS: $(hostname).local -> $resolved"
+    fi
+  fi
+
   echo
   if [[ $fail -eq 0 ]]; then
     ok "All checks passed."
@@ -946,6 +1003,7 @@ main() {
   write_cupsd_conf
   install_queue
   enable_services
+  configure_avahi
   install_firmware_timer
 
   echo

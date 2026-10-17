@@ -176,6 +176,42 @@ failure. The installer therefore blacklists it via
 `usblp` is not needed: the firmware loader prefers the CUPS backend too, and
 neither `foo2xqx` nor CUPS uses `/dev/usb/lp0`.
 
+### 6. A docker bridge can make the printer undiscoverable
+
+If Docker is installed, Avahi also publishes the printer on the `docker0`
+bridge - an interface that is not on your LAN at all. That alone is untidy, but
+it causes a silent, maddening failure: **mDNS then answers the query for
+`<host>.local` with the docker bridge address.**
+
+```console
+$ avahi-resolve -n evlon-pi.local
+evlon-pi.local	172.17.0.1        # docker0 - no phone can reach this
+```
+
+Everything looks healthy from the Pi: cupsd is up, the queue is enabled, the
+printer answers at `192.168.5.61:631` with HTTP 200, and `avahi-browse` lists
+four `_ipp._tcp` records. But when a phone discovers the printer and resolves
+its hostname, it gets an unroutable address and gives up. The printer simply
+never appears in the list.
+
+The fix is to keep Avahi off the bridges:
+
+```ini
+# /etc/avahi/avahi-daemon.conf
+[server]
+deny-interfaces=docker0,docker1,docker2
+```
+
+The installer applies this automatically (it detects `docker*`, `br-*` and
+`veth*` interfaces) and `verify_install` fails loudly if `<host>.local` still
+resolves into `172.16.0.0/12`:
+
+```
+!! evlon-pi.local resolves to 172.17.0.1 (a docker bridge) - phones will not find the printer
+```
+
+If you add Docker networks later, re-run the installer to pick them up.
+
 ## Options
 
 ```
@@ -309,6 +345,14 @@ If the queue is still `disabled`, run `sudo cupsenable HP-LaserJet-P1007`; if
 that happens repeatedly, see the `usblp` section above.
 
 **Phone does not see the printer**
+Check that the hostname resolves to a LAN address, not a docker bridge:
+
+```bash
+avahi-resolve -n $(hostname).local        # want 192.168.x.y, NOT 172.17.0.1
+avahi-browse -rtp _ipp._tcp | grep '^='  # want only wlan0 / eth0, not docker0
+```
+
+If it resolves to `172.17.0.1`, see section 6 above - re-run `sudo ./install.sh`.
 Both must be on the same subnet, and mDNS must not be filtered by the AP
 (guest-network / "AP isolation" breaks it). As a workaround add it manually by
 IP: `ipp://<pi-ip>:631/printers/HP-LaserJet-P1007`.
@@ -335,6 +379,7 @@ plugin.
 | `/etc/systemd/system/printer-firmware-refresh.{service,timer}` | runs the above every 2 min and at boot |
 | `/etc/systemd/system/multi-user.target.wants/cups.service` | start CUPS at boot |
 | `/etc/modprobe.d/blacklist-usblp.conf` | stop `usblp` from taking the printer from CUPS |
+| `/etc/avahi/avahi-daemon.conf` | `deny-interfaces` so mDNS ignores docker bridges |
 | `/root/cups-backup-<ts>/` | backup of the original CUPS config |
 
 Packages: `cups`, `cups-client`, `cups-filters`, `cups-ipp-utils`,
