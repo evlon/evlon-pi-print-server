@@ -103,8 +103,7 @@ foo2zjs: Missing HP LaserJet P1007 firmware file /lib/firmware/hp/sihpP1005.dl
 Two independent loading paths are installed:
 
 - the package's udev rule, which fires on USB plug-in, and
-- `printer-firmware-refresh.timer`, which re-checks every 2 minutes (the loader
-  skips the upload when the firmware is already present, so this is cheap).
+- `printer-firmware-refresh.timer`, which re-checks every 5 minutes.
 
 **The queue is recovered too.** When the printer is powered off, CUPS notices
 the device vanish and stops the queue with *"Unplugged or turned off"* — and it
@@ -251,6 +250,52 @@ lsmod | grep usblp
 If you see `Failed to detach`, the blacklist is missing — re-run
 `sudo ./install.sh`.
 
+**The printer is wedged: a job sits at "Sending data to printer" forever**
+
+This is the one failure a tool on the Pi cannot fix, and it is worth
+understanding.
+
+A host-based printer accepts the firmware in a narrow window after it powers
+up. If it ever ends up in a confused state (an upload interrupted half-way, a
+job killed mid-transfer, a brown-out) it stops consuming USB data. Then:
+
+- the job hangs at *Sending data to printer*, and
+- the stuck `usb` backend **keeps the USB device claimed**, so every later job
+  *and* every later firmware upload hangs too — a total deadlock.
+
+**The fix is to switch the printer off and on again.** That is the only
+reliable cure; it is the printer's own state machine that is stuck, not the Pi.
+A USB replug often works too, because it re-enumerates the device, but it
+cannot clear a wedged printer as reliably as cutting its power.
+
+Software recovery was tested and does **not** work here. All of these
+re-enumerate the device and fire the udev firmware loader, and the printer
+refuses the firmware every time:
+
+```bash
+# USBDEVFS_RESET ioctl on /dev/bus/usb/BBB/DDD
+# echo 0 > .../authorized ; echo 1 > .../authorized
+# echo 1-1.2 > /sys/bus/usb/drivers/usb/unbind ; ... bind
+```
+
+What the watchdog **does** guarantee is that the wedge never becomes permanent
+damage. Every device operation is bounded by a timeout, and each run kills any
+process that has wedged while holding the USB device, so the printer stays
+visible and one power cycle brings it straight back. After three failed
+software recoveries it backs off for 30 minutes and logs exactly what to do:
+
+```
+printer-firmware-refresh: SOFTWARE RECOVERY FAILED 3x. The printer is wedged;
+only a PHYSICAL POWER CYCLE (switch the printer off, wait 10 s, switch it on
+again) clears it.
+```
+
+Watch it with:
+
+```bash
+sudo journalctl -t printer-firmware-refresh -f
+```
+
 **Printing worked, then I power-cycled the printer and now nothing prints**
 The firmware is reloaded automatically, and so is the queue. Check within a
 couple of minutes:
@@ -286,7 +331,7 @@ plugin.
 | `/etc/cups/cupsd.conf` | LAN listening, dnssd, no-auth printing (validated) |
 | `/etc/cups/ppd/HP-LaserJet-P1007.ppd` | foo2xqx (Foomatic) PPD |
 | `/lib/firmware/hp/sihpP1005.dl`, `sihpP1007.dl` | printer firmware (verified) |
-| `/usr/local/sbin/printer-firmware-refresh` | reload firmware + revive the queue after a power cycle |
+| `/usr/local/sbin/printer-firmware-refresh` | watchdog: reap wedged processes, reload firmware, revive the queue |
 | `/etc/systemd/system/printer-firmware-refresh.{service,timer}` | runs the above every 2 min and at boot |
 | `/etc/systemd/system/multi-user.target.wants/cups.service` | start CUPS at boot |
 | `/etc/modprobe.d/blacklist-usblp.conf` | stop `usblp` from taking the printer from CUPS |

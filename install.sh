@@ -52,6 +52,9 @@ PLUGIN_FW_MEMBER="${PLUGIN_FW_MEMBER:-hp_laserjet_p1007.fw.gz}"
 
 # --- network --------------------------------------------------------------
 CUPS_PORT="${CUPS_PORT:-631}"
+# USB vendor/product of the printer (used for a software port reset).
+USB_VID="${USB_VID:-03f0}"
+USB_PID="${USB_PID:-4817}"
 # @LOCAL = any client on a directly attached subnet. Use e.g. 192.168.5.0/24
 # to restrict further.
 ALLOW_NET="${ALLOW_NET:-@LOCAL}"
@@ -572,11 +575,7 @@ enable_services() {
 }
 
 install_firmware_timer() {
-  log "Installing firmware-refresh timer"
-  # A GDI/host-based printer loses its firmware on every power-off, and CUPS
-  # tends to leave the queue stopped ("Unplugged or turned off") after it
-  # notices the device vanish. Both are repaired automatically here, so that
-  # power-cycling the printer needs no manual intervention.
+  log "Installing the printer watchdog"
   local helper="/usr/lib/udev/hplj${MODEL_TAG}"
   local recover="/usr/local/sbin/printer-firmware-refresh"
   if [[ ! -x "$helper" ]]; then
@@ -592,77 +591,162 @@ install_firmware_timer() {
 #!/bin/sh
 # Installed by usb-printer-airprint (install.sh).
 #
-# Keep the host-based P1007 usable across power cycles:
-#   1. reload its firmware if the printer lost it, then
-#   2. clear a stale "Unplugged or turned off" stop so printing resumes
-#      without anyone having to run cupsenable by hand.
+# Keeps the host-based P1007 usable:
+#   1. reap anything wedged that is holding the USB device,
+#   2. reload the printer firmware if it went missing,
+#   3. revive the CUPS queue after a power cycle,
+#   4. when software cannot fix it, SAY SO instead of hanging forever.
+#
+# Every device operation below is bounded by a timeout. An unbounded write to a
+# wedged printer is what turns "firmware went missing" into a total deadlock:
+# the stuck process keeps the USB device claimed, so every later job and every
+# later firmware upload hangs as well.
 set -u
 
 QUEUE="__QUEUE__"
 BACKEND="/usr/lib/cups/backend/usb"
+FW="/lib/firmware/hp/__FIRMWARE_NAME__"
 HELPER="/usr/lib/udev/hplj__MODEL_TAG__"
+VID="__VID__"
+PID="__PID__"
 TAG="printer-firmware-refresh"
 
-# Step 1. The helper skips the upload when FWVER is already present, so this is
-# cheap and idempotent; when the firmware really is gone it writes the blob and
-# the printer re-enumerates.
-if [ -x "$HELPER" ]; then
-  SUBSYSTEM=usb ACTION=add "$HELPER" add
-fi
+FW_TIMEOUT=90        # how long one firmware upload may take
+STUCK_BACKEND=300    # a print backend alive this long is wedged
+STATE_DIR=/run/printer-recovery
+FAIL_FILE="$STATE_DIR/consecutive-failures"
+BACKOFF_FILE="$STATE_DIR/backoff-until"
+MAX_TRIES=3          # failed software recoveries before backing off
+BACKOFF_SECS=1800
 
-# The firmware push resets the printer, so wait for it to come back.
-i=0
-while [ "$i" -lt 12 ]; do
-  "$BACKEND" 2>/dev/null | grep -q FWVER && break
-  sleep 5
-  i=$((i + 1))
-done
+log() { logger -t "$TAG" "$*"; }
+mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-# Step 2. Bring the queue back once the printer is reachable again.
-#
-# Cycling the power makes CUPS stop the queue ("Unplugged or turned off") and it
-# never restarts itself, so without this the printer stays dead until somebody
-# runs cupsenable by hand. CUPS does not persist a reason that distinguishes a
-# device drop from a manual pause, so this deliberately errs towards recovery.
-#
-# Auto-recovery is ON by default. Create /etc/printer-no-auto-enable to switch
-# it off, e.g. if you want a deliberate `cupsdisable` to stick.
-if [ -e /etc/printer-no-auto-enable ]; then
-  exit 0
-fi
+fwver_present() {
+  timeout 20 "$BACKEND" 2>/dev/null | grep -q FWVER
+}
 
-if "$BACKEND" 2>/dev/null | grep -q FWVER; then
-  if lpstat -p "$QUEUE" 2>/dev/null | grep -qi 'disabled'; then
-    if cupsenable "$QUEUE" 2>/dev/null; then
-      logger -t "$TAG" "printer is back - re-enabled queue $QUEUE"
+# Free the USB device from anything that has wedged while holding it.
+reap_wedged() {
+  # A firmware upload is always safe to kill: it is retried.
+  pkill -9 -f "$FW" 2>/dev/null || true
+
+  # A print backend alive for STUCK_BACKEND seconds has wedged. CUPS stops the
+  # job but does not reliably reap the process, and the orphan keeps the device
+  # claimed forever - blocking every later job and every firmware upload.
+  for p in $(pgrep -f "$BACKEND" 2>/dev/null); do
+    et=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${et:-}" ] && [ "$et" -gt "$STUCK_BACKEND" ]; then
+      log "killing wedged backend pid $p (alive ${et}s) - it held the printer"
+      kill -9 "$p" 2>/dev/null || true
     fi
+  done
+}
+
+# Reset the USB port. This re-enumerates the device, but note that it does NOT
+# un-wedge the printer itself if the printer's own state machine is stuck.
+reset_port() {
+  python3 - "$VID" "$PID" <<'PYEOF' 2>/dev/null || true
+import fcntl, glob, sys
+USBDEVFS_RESET = (ord('U') << 8) | 20
+vid, pid = sys.argv[1], sys.argv[2]
+for base in glob.glob('/sys/bus/usb/devices/*'):
+    try:
+        if open(base + '/idVendor').read().strip() != vid:
+            continue
+        if open(base + '/idProduct').read().strip() != pid:
+            continue
+        node = '/dev/bus/usb/%03d/%03d' % (
+            int(open(base + '/busnum').read().strip()),
+            int(open(base + '/devnum').read().strip()))
+    except Exception:
+        continue
+    try:
+        with open(node, 'rb+', buffering=0) as f:
+            fcntl.ioctl(f.fileno(), USBDEVFS_RESET, 0)
+    except Exception:
+        pass
+PYEOF
+}
+
+# ------------------------------------------------------------------- main --
+reap_wedged
+
+if fwver_present; then
+  rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
+else
+  # Do not hammer a dead printer: after MAX_TRIES failures, wait it out.
+  if [ -f "$BACKOFF_FILE" ]; then
+    until=$(cat "$BACKOFF_FILE" 2>/dev/null || echo 0)
+    [ "$(date +%s)" -lt "${until:-0}" ] && exit 0
+  fi
+
+  log "printer reports no FWVER - firmware missing, attempting software recovery"
+  reset_port
+  sleep 5
+  [ -x "$HELPER" ] && SUBSYSTEM=usb ACTION=add "$HELPER" add
+
+  i=0
+  while [ "$i" -lt 12 ]; do
+    fwver_present && break
+    sleep 5
+    i=$((i + 1))
+  done
+
+  if fwver_present; then
+    log "firmware restored by software recovery"
+    rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
+  else
+    # Never leave a hung upload holding the device hostage.
+    pkill -9 -f "$FW" 2>/dev/null || true
+    fails=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+    echo "$fails" >"$FAIL_FILE" 2>/dev/null || true
+    if [ "$fails" -ge "$MAX_TRIES" ]; then
+      echo $(( $(date +%s) + BACKOFF_SECS )) >"$BACKOFF_FILE" 2>/dev/null || true
+      log "SOFTWARE RECOVERY FAILED ${fails}x. The printer is wedged; only a PHYSICAL"
+      log "POWER CYCLE (switch the printer off, wait 10 s, switch it on again) clears it."
+      log "Backing off for $((BACKOFF_SECS / 60)) minutes."
+    else
+      log "software recovery attempt ${fails} failed; will retry"
+    fi
+    exit 0
   fi
 fi
 
+# ---- revive the queue ----------------------------------------------------
+if [ -e /etc/printer-no-auto-enable ]; then
+  exit 0
+fi
+if lpstat -p "$QUEUE" 2>/dev/null | grep -qi disabled; then
+  if cupsenable "$QUEUE" 2>/dev/null; then
+    log "printer is back - re-enabled queue $QUEUE"
+  fi
+fi
 exit 0
 RECOVEREOF
-    sed -i "s#__QUEUE__#${PRINTER_NAME}#g; s#__MODEL_TAG__#${MODEL_TAG}#g" "$recover"
+    sed -i "s#__QUEUE__#${PRINTER_NAME}#g; s#__FIRMWARE_NAME__#${FIRMWARE_NAME}#g; s#__MODEL_TAG__#${MODEL_TAG}#g; s#__VID__#${USB_VID}#g; s#__PID__#${USB_PID}#g" "$recover"
     chmod 755 "$recover"
 
     cat >/etc/systemd/system/printer-firmware-refresh.service <<UNITEOF
 [Unit]
-Description=Ensure the HP LaserJet ${MODEL_TAG} firmware is loaded and the queue is usable
+Description=Keep the HP LaserJet ${MODEL_TAG} printer reachable and its queue usable
 After=network.target cups.service
 Wants=cups.service
 
 [Service]
 Type=oneshot
 ExecStart=${recover}
+TimeoutStartSec=600
 UNITEOF
 
     cat >/etc/systemd/system/printer-firmware-refresh.timer <<'TIMEREOF'
 [Unit]
-Description=Periodically ensure the USB printer is ready to print
+Description=Periodically check that the USB printer is ready
 
 [Timer]
 OnBootSec=45s
-OnUnitActiveSec=120s
-AccuracySec=5s
+OnUnitActiveSec=300s
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
@@ -673,7 +757,7 @@ TIMEREOF
   run systemctl daemon-reload
   run systemctl enable --now printer-firmware-refresh.timer
   run_soft systemctl start printer-firmware-refresh.service
-  ok "firmware-refresh timer active"
+  ok "printer watchdog active"
 }
 
 # ---------------------------------------------------------------------------
@@ -847,8 +931,15 @@ Done. How to print from a phone (must be on the same WiFi/LAN):
   Browser        : http://${ip}:${CUPS_PORT}/
 
 Note: this printer is host-based (GDI) and needs its firmware pushed on every
-power-up. That happens automatically via udev on plug-in, and via
-printer-firmware-refresh.timer as a fallback (within ~2 min).
+power-up. udev does that automatically the moment the printer is switched on.
+
+A watchdog re-checks every 5 minutes. It reaps any process that has wedged
+while holding the USB device, reloads missing firmware, and revives the queue
+after a power cycle.
+
+If a job ever hangs at "Sending data to printer", the printer itself has wedged
+and no software can clear it: switch the printer OFF and ON again. Everything
+then recovers on its own within a few seconds.
 EOF
 }
 
