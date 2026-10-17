@@ -626,10 +626,31 @@ fwver_present() {
   timeout 20 "$BACKEND" 2>/dev/null | grep -q FWVER
 }
 
+# Is a firmware upload legitimately in flight right now?
+#
+# udev starts one the moment the printer is switched on. Interrupting that is
+# exactly what used to break recovery after a power cycle, so we must never
+# kill a young upload - only one that has clearly hung.
+upload_running() {
+  for p in $(pgrep -f "$FW" 2>/dev/null); do
+    et=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${et:-}" ] && [ "$et" -le "$FW_TIMEOUT" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Free the USB device from anything that has wedged while holding it.
 reap_wedged() {
-  # A firmware upload is always safe to kill: it is retried.
-  pkill -9 -f "$FW" 2>/dev/null || true
+  # Kill firmware uploads only once they have hung, never one still working.
+  for p in $(pgrep -f "$FW" 2>/dev/null); do
+    et=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${et:-}" ] && [ "$et" -gt "$FW_TIMEOUT" ]; then
+      log "killing hung firmware upload pid $p (alive ${et}s)"
+      kill -9 "$p" 2>/dev/null || true
+    fi
+  done
 
   # A print backend alive for STUCK_BACKEND seconds has wedged. CUPS stops the
   # job but does not reliably reap the process, and the orphan keeps the device
@@ -670,15 +691,29 @@ PYEOF
 }
 
 # ------------------------------------------------------------------- main --
-reap_wedged
-
 if fwver_present; then
   rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
 else
+  # A power cycle makes udev start a firmware upload by itself. Let it finish.
+  if upload_running; then
+    exit 0
+  fi
+
   # Do not hammer a dead printer: after MAX_TRIES failures, wait it out.
   if [ -f "$BACKOFF_FILE" ]; then
     until=$(cat "$BACKOFF_FILE" 2>/dev/null || echo 0)
     [ "$(date +%s)" -lt "${until:-0}" ] && exit 0
+  fi
+
+  # Free the device before judging it. A wedged print backend claims the USB
+  # device, which looks identical to missing firmware from out here.
+  reap_wedged
+  sleep 3
+
+  if fwver_present; then
+    log "printer was fine - a wedged process had been holding the USB device"
+    rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
+    exit 0
   fi
 
   log "printer reports no FWVER - firmware missing, attempting software recovery"
@@ -697,8 +732,12 @@ else
     log "firmware restored by software recovery"
     rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
   else
-    # Never leave a hung upload holding the device hostage.
-    pkill -9 -f "$FW" 2>/dev/null || true
+    # Never leave a hung upload holding the device hostage (but do not touch
+    # one that is still making progress).
+    for p in $(pgrep -f "$FW" 2>/dev/null); do
+      et=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')
+      [ -n "${et:-}" ] && [ "$et" -gt "$FW_TIMEOUT" ] && kill -9 "$p" 2>/dev/null || true
+    done
     fails=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
     echo "$fails" >"$FAIL_FILE" 2>/dev/null || true
     if [ "$fails" -ge "$MAX_TRIES" ]; then
