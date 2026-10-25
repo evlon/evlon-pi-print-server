@@ -762,6 +762,25 @@ fwver_present() {
   timeout 20 "$BACKEND" 2>/dev/null | grep -q FWVER
 }
 
+# Is the printer physically present and powered on?
+#
+# This is NOT the same question as fwver_present(). A switched-off printer has
+# no firmware because it is not there at all, and doing USB resets or firmware
+# uploads against a missing device is pointless: they can only fail, and they
+# pollute the failure counter. Home users switch this printer off for days at a
+# time, so a printer that is simply absent must be a no-op, not a fault.
+printer_online() {
+  local d
+  for d in /sys/bus/usb/devices/*/; do
+    if [[ -f "${d}idVendor" && -f "${d}idProduct" ]] && \
+       [[ "$(cat "${d}idVendor" 2>/dev/null)" == "$VID" ]] && \
+       [[ "$(cat "${d}idProduct" 2>/dev/null)" == "$PID" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Is a firmware upload legitimately in flight right now?
 #
 # udev starts one the moment the printer is switched on. Interrupting that is
@@ -827,6 +846,13 @@ PYEOF
 }
 
 # ------------------------------------------------------------------- main --
+# Printer switched off (or unplugged): nothing to do. Clear any stale failure
+# state so that the next switch-on starts from a clean slate.
+if ! printer_online; then
+  rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
+  exit 0
+fi
+
 if fwver_present; then
   rm -f "$FAIL_FILE" "$BACKOFF_FILE" 2>/dev/null || true
 else

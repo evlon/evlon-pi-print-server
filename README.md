@@ -97,6 +97,33 @@ reboots and does not need reinstalling.
 > `PPD_DRIVER_ID=foo2zjs:0/ppd/foo2zjs/HP-LaserJet_P1007.ppd`. It prints, but
 > expect the faint dotted look described above.
 
+#### How this was actually found (a list of dead ends)
+
+Worth reading before you start tuning, because every one of these *looks* like a
+plausible cause and none of them is:
+
+| Suspect | Why it seemed right | What it actually did |
+|---|---|---|
+| Empty / damp toner | faint grey output is the classic symptom | no effect; the same cartridge is perfect via Windows |
+| `Density` 3 → 5 | `foo2xqx` defaults to 3 (medium) | stream said `@PJL SET DENSITY=5`, still dotted |
+| `hpcups` needs plugin | error 48 is literally a plugin error | installing the plugin *is* required, but for HBS — see below |
+| `RET=OFF` | HP's edge enhancement can split thin strokes | made it **worse**; `MEDIUM` was helping |
+| `halftone=wts` / `as` / `standard` | dotted look = dithering | no visible change |
+| `1200x600` vs `600x600` | avoids vertical interpolation | no improvement (larger stream, same look) |
+| Firmware version | `FWVER` changed to 20100824 after a Windows session | irrelevant; firmware does not change the host protocol |
+
+The test that settled it: **print the identical page from Windows**. Perfectly
+crisp. Same printer, same paper, same toner — so the hardware was never the
+problem, and the only remaining variable is the host-side data format.
+
+Two things that cost a lot of time and are worth remembering:
+
+1. **"It prints" is not "the driver is correct."** `foo2xqx` produces valid
+   output for this printer. Every byte-level check passes. Only the *rendering*
+   is wrong, and only on paper.
+2. **`CMD:HBS` in the device ID is the answer.** Check the protocol a printer
+   advertises before picking a driver, not after the output looks bad.
+
 ### 2. The firmware has to be pushed into the printer — every power-up
 
 Being host-based, the P1007 boots with no firmware and must be fed
@@ -289,10 +316,14 @@ supported way to adapt the script to a **different but similar** HP printer:
 ```bash
 sudo MODEL_TAG=P1006 \
      USB_MODEL_MATCH='LaserJet P1006' \
-     PPD_DRIVER_ID='foo2zjs:0/ppd/foo2zjs/HP-LaserJet_P1006.ppd' \
+     PPD_DRIVER_ID='drv:///hpcups.drv/hp-laserjet_p1006.ppd' \
      FIRMWARE_NAME=sihpP1006.dl \
      ./install.sh
 ```
+
+Before adapting it, check what protocol the target printer advertises (`CMD:`
+in its device ID) — that is what determines whether hpcups or foo2xqx is right,
+and it matters far more than any option. See section 1.
 
 The script is **idempotent** — re-running it re-creates the queue and rewrites
 the config from scratch, backing up the previous CUPS configuration first to
@@ -301,11 +332,14 @@ the config from scratch, backing up the previous CUPS configuration first to
 ## Verifying by hand
 
 ```bash
-# is cupsd up and listening?
+# is cupsd up and listening on BOTH families?
 systemctl is-active cups && ss -tln | grep 631
 
-# is the queue using the open-source driver (must NOT say hpcups)?
-grep -E 'ShortNickName|FoomaticIDs' /etc/cups/ppd/HP-LaserJet-P1007.ppd
+# which driver does the queue really use? (want: hpcups, NOT foo2xqx)
+grep -E 'NickName|cupsFilter' /etc/cups/ppd/HP-LaserJet-P1007.ppd
+
+# is the HBS driver from HP's plugin present?
+ls -l /usr/share/hplip/prnt/plugins/hbpl1.so
 
 # is the printer announced over Bonjour? (look for mopria-certified / URF)
 avahi-browse -rtp _ipp._tcp
@@ -315,11 +349,23 @@ lp -d HP-LaserJet-P1007 /etc/hostname
 lpstat -l -W completed -o | tail -5      # want: job-completed-successfully
 ```
 
+Only one of those six checks catches wrong output: **the driver check**. A
+`foo2xqx` queue passes every other one while printing faint dotted text, because
+its data stream is structurally valid. When output quality is the complaint,
+start there — and confirm by printing the same page from a machine with HP's
+official driver.
+
 ## Troubleshooting
 
+**Text prints faint, grey, or visibly made of dots and dashes**
+The queue is on `foo2xqx` instead of `hpcups`. Check the driver as above and
+re-run `sudo ./install.sh`. See section 1 — this is a protocol difference, not a
+tuning problem, so do not start with density or halftone options.
+
 **Jobs fail with `Filter failed` / `hplip.plugin-error`**
-The queue is still the `hpcups` one. Re-run `sudo ./install.sh`; it deletes and
-recreates the queue. Confirm with the `grep` above.
+`hpcups` is in use but HP's plugin is missing. Re-run `sudo ./install.sh`, or
+install `hplip-3.22.10-plugin.run` by hand and pass `--hplip-plugin PATH`.
+Confirm `hbpl1.so` exists as shown above.
 
 **`foo2zjs: Missing HP LaserJet P1007 firmware file /lib/firmware/hp/sihpP1005.dl`**
 The alias name is missing. `sudo ./install.sh` installs both names.
@@ -464,6 +510,36 @@ Packages: `cups`, `cups-client`, `cups-filters`, `cups-ipp-utils`,
   `ALLOW_NET=192.168.5.0/24`, or tighten `<Location />` afterwards.
 - CUPS administration still requires system authentication.
 - Nothing is exposed to the internet; do not port-forward 631.
+
+## Daily use: a printer you switch off between jobs
+
+A home printer like this one may print a couple of pages a week, while the Pi
+stays on permanently. That is the intended setup — **leave the Pi running and
+switch the printer off whenever you are not using it.** You do not need to
+reboot the Pi, reload firmware, or re-add the queue.
+
+```
+before printing : press the printer's power button, wait ~10 s (LED goes green)
+printing        : share from the phone, as usual
+after           : press the printer's power button again
+the Pi          : leave it on, indefinitely
+```
+
+Why the Pi should stay on: when it boots, the mDNS advertisement and the phone's
+Bonjour cache both have to be rebuilt, which is exactly when "the printer does
+not appear" happens. A Pi that is always on has none of that churn. It is also
+cheap to keep running — the whole stack (cupsd, avahi, the watchdog) idles at a
+few hundred MB of RAM and near-zero CPU.
+
+**Wait for the job to finish before switching the printer off.** Cutting power
+mid-transfer is what leaves the printer in the confused state described under
+[the wedged-printer entry](#troubleshooting) — that is the one failure software
+cannot clear. If in doubt, wait a few seconds after the last page comes out.
+
+Switching the printer off is handled cleanly: the watchdog notices the device is
+absent and does nothing at all, instead of treating it as missing firmware and
+trying to reload it. On power-on, udev feeds the firmware within a second or two
+and the queue is already there waiting.
 
 ## Uninstall
 
