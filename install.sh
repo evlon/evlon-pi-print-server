@@ -32,7 +32,16 @@ MODEL_TAG="${MODEL_TAG:-P1007}"
 # Substring used to find the printer among USB devices.
 USB_MODEL_MATCH="${USB_MODEL_MATCH:-LaserJet P1007}"
 # CUPS driver id (see `lpinfo -m`). P1007 is driven by foo2xqx via foomatic-rip.
-PPD_DRIVER_ID="${PPD_DRIVER_ID:-foo2zjs:0/ppd/foo2zjs/HP-LaserJet_P1007.ppd}"
+# P1007 speaks HBS (Host-Based Streaming) natively. HP's own hpcups driver uses
+# it and renders crisp text. foo2xqx only *emulates* the printer with the
+# ZjStream dialect it was written for (the M1005), and on this printer that
+# shows up as thin, washed-out, "dashed" text - while the same page printed
+# through HP's Windows driver looks perfect. So hpcups is the correct choice,
+# and it needs HP's proprietary plugin installed first.
+PPD_DRIVER_ID="${PPD_DRIVER_ID:-drv:///hpcups.drv/hp-laserjet_p1007.ppd}"
+HPLIP_PLUGIN_VER="${HPLIP_PLUGIN_VER:-3.22.10}"
+HPLIP_PLUGIN_URL="${HPLIP_PLUGIN_URL:-https://www.openprinting.org/download/printdriver/auxfiles/HP/plugins/hplip-${HPLIP_PLUGIN_VER}-plugin.run}"
+HPLIP_PLUGIN_MD5="${HPLIP_PLUGIN_MD5:-e21f6fc2eba23d33846b340c3a960586}"
 
 # --- firmware -------------------------------------------------------------
 # IMPORTANT: on this Debian package /usr/lib/udev/hpljP1007 maps
@@ -59,6 +68,13 @@ USB_PID="${USB_PID:-4817}"
 # to restrict further.
 ALLOW_NET="${ALLOW_NET:-@LOCAL}"
 
+# Print density 1-5. foo2xqx defaults to 3, which renders faint grey text on a
+# P1007 - close to unreadable on a worn cartridge. 5 maps to
+# "@PJL SET DENSITY=5" and is the safe default for this printer.
+PRINT_DENSITY="${PRINT_DENSITY:-5}"
+# Halftone algorithm. "wts" (Well Tempered Screens) gives the best greys.
+PRINT_HALFTONE="${PRINT_HALFTONE:-wts}"
+
 # --- behaviour ------------------------------------------------------------
 DRY_RUN=0
 DO_TEST=0
@@ -66,6 +82,7 @@ DO_APT_UPDATE=1
 PLUGIN_FALLBACK=0
 UNINSTALL=0
 FIRMWARE_FILE=""
+HPLIP_PLUGIN_FILE="${HPLIP_PLUGIN_FILE:-}"
 DEVICE_URI="${DEVICE_URI:-}"
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; BLU=$'\033[34m'; RST=$'\033[0m'
@@ -87,6 +104,8 @@ Options:
   --desc TEXT          Human readable description (default: $PRINTER_DESC)
   --device-uri URI     Skip USB auto-detection and use this URI
   --firmware-file PATH Use a local firmware file instead of downloading
+  --hplip-plugin PATH  Use a local HPLIP plugin .run instead of downloading
+                       (needed by hpcups; ~11 MB, md5 verified)
   --plugin-fallback    If the firmware mirror fails, extract the firmware
                        from the official HPLIP plugin (~11 MB download)
   --test               Submit a physical test page (uses one sheet of paper)
@@ -110,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --desc)            PRINTER_DESC="$2"; shift 2 ;;
     --device-uri)      DEVICE_URI="$2";   shift 2 ;;
     --firmware-file)   FIRMWARE_FILE="$2"; shift 2 ;;
+    --hplip-plugin)    HPLIP_PLUGIN_FILE="$2"; shift 2 ;;
     --plugin-fallback) PLUGIN_FALLBACK=1; shift ;;
     --test)            DO_TEST=1; shift ;;
     --no-apt-update)   DO_APT_UPDATE=0; shift ;;
@@ -210,6 +230,7 @@ install_packages() {
     cups-ipp-utils
     avahi-daemon
     avahi-utils
+    hplip
     printer-driver-foo2zjs
     printer-driver-foo2zjs-common
   )
@@ -301,6 +322,65 @@ fetch_firmware() {
   ok "firmware installed as $FIRMWARE_NAME"
 }
 
+# ---------------------------------------------------------------------------
+# HPLIP proprietary plugin
+# ---------------------------------------------------------------------------
+# hpcups needs HP's plugin for the P1007: it carries the HBS printer driver
+# (prnt/plugins/hbpl1.so), without which every job dies with
+# "hplip.plugin-error / Filter failed". Debian cannot ship it, so fetch it.
+plugin_installed() {
+  [[ -f /usr/share/hplip/prnt/plugins/hbpl1.so ]] || return 1
+  [[ -f /usr/share/hplip/data/firmware/hp_laserjet_p1007.fw.gz ]] || return 1
+  return 0
+}
+
+install_hplip_plugin() {
+  if plugin_installed; then
+    ok "HPLIP plugin already installed"
+    return 0
+  fi
+
+  log "Installing the HPLIP proprietary plugin (provides the HBS driver)"
+  local work; work="$(make_workdir)"
+  local run="$work/hplip-plugin.run"
+
+  if [[ -n "${HPLIP_PLUGIN_FILE:-}" ]]; then
+    cp -f "$HPLIP_PLUGIN_FILE" "$run" || die "cannot read $HPLIP_PLUGIN_FILE"
+  else
+    log "Downloading $HPLIP_PLUGIN_VER plugin (~11 MB)"
+    if ! curl -fL --retry 5 --retry-delay 5 --retry-all-errors --max-time 3600 \
+              -o "$run" "$HPLIP_PLUGIN_URL"; then
+      die "could not download the HPLIP plugin. Get hplip-${HPLIP_PLUGIN_VER}-plugin.run from
+       https://www.openprinting.org/download/printdriver/auxfiles/HP/plugins/
+       and pass --hplip-plugin PATH"
+    fi
+  fi
+
+  if command -v md5sum >/dev/null 2>&1 && [[ -n "$HPLIP_PLUGIN_MD5" ]]; then
+    local got; got="$(md5sum "$run" | awk '{print $1}')"
+    [[ "$got" == "$HPLIP_PLUGIN_MD5" ]] || die "plugin md5 mismatch: $got"
+  fi
+  ok "plugin verified"
+
+  chmod +x "$run"
+  local ext="$work/extracted"
+  mkdir -p "$ext"
+  bash "$run" --noexec --target "$ext" >/dev/null 2>&1 || die "could not unpack the plugin"
+
+  # installPlugin.py looks for plugin.spec in $HOMEDIR
+  if [[ -f "$ext/plugin.spec" ]]; then
+    run cp -f "$ext/plugin.spec" /usr/share/hplip/plugin.spec
+  fi
+
+  ( cd "$ext" && python3 installPlugin.py -i ) >/dev/null 2>&1 || true
+  rm -rf "$work"
+
+  if plugin_installed; then
+    ok "HPLIP plugin installed (hbpl1.so + P1007 firmware)"
+  else
+    die "plugin installation failed - hpcups cannot drive this printer without it"
+  fi
+}
 # ---------------------------------------------------------------------------
 # USB driver
 # ---------------------------------------------------------------------------
@@ -531,8 +611,8 @@ install_queue() {
   fi
   ok "device URI: $uri"
 
-  # Remove any stale queue with the same name so the driver is never mixed up
-  # (the classic failure: an hpcups queue left over, requiring HP's plugin).
+  # Remove any stale queue with the same name first, so the PPD is rebuilt from
+  # scratch instead of being silently inherited from the previous driver.
   run_soft lpadmin -x "$PRINTER_NAME"
 
   log "Creating CUPS queue '$PRINTER_NAME'"
@@ -547,10 +627,18 @@ install_queue() {
   run_soft cupsenable "$PRINTER_NAME"
   run_soft cupsaccept "$PRINTER_NAME"
 
-  # Refuse to silently ship a queue that still needs the proprietary plugin.
-  if [[ -f "/etc/cups/ppd/$PRINTER_NAME.ppd" ]] && \
-     grep -qiE 'hpcups|requires proprietary plugin' "/etc/cups/ppd/$PRINTER_NAME.ppd"; then
-    die "queue PPD still references hpcups - driver selection failed"
+  # Make sure the queue really got the driver we asked for. The classic silent
+  # failure is a stale queue that keeps its old PPD, so the driver never changes.
+  local ppd="/etc/cups/ppd/$PRINTER_NAME.ppd"
+  if [[ -f "$ppd" ]]; then
+    if [[ "$PPD_DRIVER_ID" == *hpcups* ]]; then
+      grep -q 'hpcups' "$ppd" || die "queue PPD is not the hpcups driver - selection failed"
+      plugin_installed || die "hpcups queue but the HPLIP plugin is missing"
+    else
+      # foo2xqx must never end up on an hpcups PPD
+      grep -q 'hpcups' "$ppd" && die "queue PPD still references hpcups - driver selection failed"
+      true
+    fi
   fi
   ok "queue created with $PPD_DRIVER_ID"
 }
@@ -853,13 +941,10 @@ TIMEREOF
 
 # Prove the render pipeline works *without* sending anything to the printer or
 # using a sheet of paper: run the real CUPS filter chain and inspect the bytes
-# it produces. A correct P1007 chain emits an HP PJL job containing XQX raster.
+# it produces. A correct P1007 chain emits an HP PJL job with raster payload.
 verify_pipeline() {
   local ppd="/etc/cups/ppd/$PRINTER_NAME.ppd"
-  local filter="/usr/lib/cups/filter/foomatic-rip"
-  if [[ ! -f "$ppd" || ! -x "$filter" ]]; then
-    return 0
-  fi
+  [[ -f "$ppd" ]] || return 0
 
   local work; work="$(make_workdir)"
   cat >"$work/in.ps" <<'PSEOF'
@@ -870,18 +955,37 @@ showpage
 PSEOF
 
   local rc=0
-  if ! PPD="$ppd" "$filter" 1 root pipeline-check 1 "PageSize=A4" "$work/in.ps" \
-        >"$work/out.prn" 2>"$work/err.txt"; then
-    rc=1
-  fi
-  local size=0 magic=""
-  if [[ -f "$work/out.prn" ]]; then
-    size="$(stat -c %s "$work/out.prn")"
-    magic="$(head -c 20 "$work/out.prn" | tr -d '\0')"
+  if [[ "$PPD_DRIVER_ID" == *hpcups* ]]; then
+    # hpcups consumes CUPS raster, not PostScript, so render one with gs first.
+    local filter="/usr/lib/cups/filter/hpcups"
+    if [[ ! -x "$filter" ]] || ! command -v gs >/dev/null 2>&1; then
+      rm -rf "$work"; return 0
+    fi
+    gs -q -dBATCH -dSAFER -dNOPAUSE -sDEVICE=cups -sOutputFile="$work/in.raster" \
+       -r600 -g5100x6600 -dDEVICEWIDTHPOINTS=595 -dDEVICEHEIGHTPOINTS=842 \
+       -dcupsBitsPerColor=1 -dcupsColorSpace=3 -dcupsRowCount=1 -dcupsRowStep=1 \
+       -dcupsInteger0=0 -dcupsInteger1=0 -dcupsInteger2=0 -dcupsInteger3=0 \
+       "$work/in.ps" 2>/dev/null || rc=1
+    PPD="$ppd" "$filter" 1 root pipeline-check 1 "PageSize=A4" "$work/in.raster" \
+        >"$work/out.prn" 2>"$work/err.txt" || rc=1
+  else
+    local filter="/usr/lib/cups/filter/foomatic-rip"
+    if [[ ! -x "$filter" ]]; then
+      rm -rf "$work"; return 0
+    fi
+    PPD="$ppd" "$filter" 1 root pipeline-check 1 "PageSize=A4" "$work/in.ps" \
+        >"$work/out.prn" 2>"$work/err.txt" || rc=1
   fi
 
+  local size=0 magic=""
+  if [[ -f "$work/out.prn" ]]; then
+    size="$(stat -c %s "$work/out.prn" 2>/dev/null || echo 0)"
+    magic="$(head -c 40 "$work/out.prn" | tr -d '\0')"
+  fi
+
+  # Both drivers must emit a real HP job: the PJL banner plus raster payload.
   if [[ $rc -eq 0 ]] && [[ "$size" -gt 500 ]] && [[ "$magic" == *PJL* ]]; then
-    ok "render pipeline OK - produced $size bytes of HP PJL/XQX data (no paper used)"
+    ok "render pipeline OK - produced $size bytes of HP PJL raster (no paper used)"
   else
     warn "render pipeline check failed (rc=$rc, $size bytes)"
     [[ -s "$work/err.txt" ]] && warn "  filter said: $(head -1 "$work/err.txt")"
@@ -917,6 +1021,7 @@ verify_install() {
   else
     warn "queue '$PRINTER_NAME' missing"; fail=1
   fi
+
 
   if [[ -f "/lib/firmware/hp/$FIRMWARE_NAME" ]]; then
     ok "firmware present: /lib/firmware/hp/$FIRMWARE_NAME"
@@ -1016,6 +1121,9 @@ main() {
   fetch_firmware
   backup_cups_config
   write_cupsd_conf
+  if [[ "$PPD_DRIVER_ID" == *hpcups* ]]; then
+    install_hplip_plugin
+  fi
   install_queue
   enable_services
   configure_avahi

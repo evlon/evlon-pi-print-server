@@ -47,11 +47,40 @@ Making this particular printer work is notoriously annoying. This script encodes
 the five things that actually matter, each of which is a silent failure
 otherwise.
 
-### 1. The printer is *host-based* (GDI), and needs the right driver
+### 1. The printer speaks HBS — and that decides which driver to use
 
-The P1007 has no PostScript/PCL interpreter — the host renders every page. CUPS
-ships an `hpcups` queue for it, but that one **requires HP's proprietary plugin**.
-Without the plugin every job dies with:
+The P1007 has no PostScript/PCL interpreter; the host renders every page. Its
+device ID says exactly which host protocol it wants:
+
+```
+MFG:Hewlett-Packard;MDL:HP LaserJet P1007;CMD:HBS,PJL,ACL;...
+```
+
+**`HBS` is Host-Based Streaming, the printer's native language.** This matters
+more than any tuning option, and it is the difference between faint, dotted text
+and crisp output:
+
+| Driver | Format | Result on a P1007 |
+|---|---|---|
+| `hpcups` (HP, needs plugin) | **HBS** — native | crisp, solid text |
+| `foo2xqx` (open source) | ZjStream/XQX — emulated | thin, washed-out, visibly "dashed" glyphs |
+
+`foo2xqx` is not broken; it is simply written for a different printer. Its own
+source says so:
+
+```
+Convert Ghostscript pbmraw format to a monochrome ZJS stream,
+for driving the HP LaserJet M1005 MFP laser printer.
+```
+
+It drives a P1007 well enough to put ink on paper, so it looks like it works —
+which is why this is easy to get wrong. Print the same page through HP's Windows
+driver and the difference is obvious immediately. No amount of `Density`,
+`halftone`, `RET` or resolution tuning closes that gap; the protocol differs.
+
+So this installer uses **`hpcups`**, which needs HP's proprietary plugin (it
+carries `prnt/plugins/hbpl1.so`, the HBS implementation). Without the plugin
+every job dies with:
 
 ```
 STATE: +hplip.plugin-error
@@ -59,28 +88,19 @@ HPCupsFilter.cpp 505: m_Job initialization failed with error = 48
 Filter failed
 ```
 
-The open-source answer is **foo2zjs** — and specifically the **`foo2xqx`**
-driver, *not* `foo2zjs`. The upstream Makefile is authoritative:
+The installer therefore fetches and installs `hplip-3.22.10-plugin.run`
+(~11 MB, md5 verified) when it is missing, or takes a local copy via
+`--hplip-plugin PATH`. The plugin lives in `/usr/share/hplip`, so it survives
+reboots and does not need reinstalling.
 
-```
-*P1[05]0[5678]*) driver=foo2xqx;;
-```
-
-So the queue must be built with the `foo2zjs:` PPD (which is a *Foomatic* PPD
-that calls `foo2xqx-wrapper` through `foomatic-rip`): the script selects
-`foo2zjs:0/ppd/foo2zjs/HP-LaserJet_P1007.ppd` and then **verifies the resulting
-PPD contains no `hpcups` reference**, aborting if it does.
-
-> The PPD is generated on demand by CUPS from the `printer-driver-foo2zjs`
-> package. Nothing needs to be downloaded — but note that
-> `foomatic-db-compressed-ppds` does *not* contain it, and a bare
-> `foomatic-db-compressed-ppds list | grep foo2zjs` returns nothing. Don't be
-> fooled by that: `lpinfo -m` and the CUPS driver helper both know about it.
+> If you prefer to stay entirely open source, set
+> `PPD_DRIVER_ID=foo2zjs:0/ppd/foo2zjs/HP-LaserJet_P1007.ppd`. It prints, but
+> expect the faint dotted look described above.
 
 ### 2. The firmware has to be pushed into the printer — every power-up
 
 Being host-based, the P1007 boots with no firmware and must be fed
-/lib/firmware/hp/sihpP1007.dl over USB before it will accept a job. Debian **removed these
+`/lib/firmware/hp/sihpP1007.dl` over USB before it will accept a job. Debian **removed these
 firmware files for licensing reasons**, so a stock install cannot print at all.
 
 The script downloads the blob and verifies it three ways (size, `@PJL` header,
@@ -423,7 +443,9 @@ plugin.
 | Path | Purpose |
 |---|---|
 | `/etc/cups/cupsd.conf` | LAN listening, dnssd, no-auth printing (validated) |
-| `/etc/cups/ppd/HP-LaserJet-P1007.ppd` | foo2xqx (Foomatic) PPD |
+| `/etc/cups/ppd/HP-LaserJet-P1007.ppd` | hpcups PPD (native HBS driver) |
+| `/usr/share/hplip/prnt/plugins/hbpl1.so` | HBS driver from HP's plugin |
+| `/usr/share/hplip/data/firmware/hp_laserjet_p1007.fw.gz` | P1007 firmware from the plugin |
 | `/lib/firmware/hp/sihpP1005.dl`, `sihpP1007.dl` | printer firmware (verified) |
 | `/usr/local/sbin/printer-firmware-refresh` | watchdog: reap wedged processes, reload firmware, revive the queue |
 | `/etc/systemd/system/printer-firmware-refresh.{service,timer}` | runs the above every 2 min and at boot |
@@ -433,7 +455,7 @@ plugin.
 | `/root/cups-backup-<ts>/` | backup of the original CUPS config |
 
 Packages: `cups`, `cups-client`, `cups-filters`, `cups-ipp-utils`,
-`avahi-daemon`, `avahi-utils`, `printer-driver-foo2zjs{,-common}`.
+`avahi-daemon`, `avahi-utils`, `hplip`, `printer-driver-foo2zjs{,-common}`.
 
 ## Security notes
 
