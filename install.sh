@@ -372,7 +372,13 @@ ErrorPolicy retry-job
 
 # --- network exposure -------------------------------------------------------
 # Bind TCP 631 on every interface so phones on the WiFi can reach IPP.
+#
+# Both address families are required. "Listen 0.0.0.0:631" alone binds IPv4
+# only, yet Bonjour still advertises the printer's IPv6 address - and iOS and
+# Android prefer IPv6. The phone then resolves the printer to an address
+# nothing is listening on and the printer never appears (or a job fails).
 Listen 0.0.0.0:__PORT__
+Listen [::]:__PORT__
 Listen /run/cups/cups.sock
 
 # Publish shared queues via DNS-SD (Bonjour/mDNS). This is what makes iPhone
@@ -892,9 +898,18 @@ verify_install() {
   else warn "cups.service not active"; fail=1; fi
 
   if ss -tln 2>/dev/null | grep -q ":${CUPS_PORT} "; then
-    ok "CUPS listening on :${CUPS_PORT}"
+    ok "CUPS listening on IPv4 :${CUPS_PORT}"
   else
-    warn "nothing listening on :${CUPS_PORT}"; fail=1
+    warn "nothing listening on IPv4 :${CUPS_PORT}"; fail=1
+  fi
+
+  # Bonjour advertises IPv6 addresses as well, and phones prefer them. Missing
+  # here is invisible until a phone silently refuses to use the printer.
+  if ss -tln 2>/dev/null | grep -qE "\[::\]:${CUPS_PORT}|:::${CUPS_PORT}"; then
+    ok "CUPS listening on IPv6 :${CUPS_PORT}"
+  else
+    warn "CUPS is not listening on IPv6 - phones that prefer IPv6 will fail"
+    fail=1
   fi
 
   if lpstat -v 2>/dev/null | grep -q "$PRINTER_NAME"; then

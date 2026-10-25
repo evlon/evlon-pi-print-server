@@ -212,6 +212,39 @@ resolves into `172.16.0.0/12`:
 
 If you add Docker networks later, re-run the installer to pick them up.
 
+### 7. CUPS must listen on IPv6 as well as IPv4
+
+`Listen 0.0.0.0:631` binds **IPv4 only**. That is not enough here, and the
+failure is easy to miss because every IPv4 check keeps passing:
+
+```console
+$ ss -tln | grep 631
+LISTEN  0.0.0.0:631          # IPv4 only - no [::]:631
+```
+
+Bonjour advertises the printer's **IPv6 address too** (a home LAN normally has a
+global one via router advertisement), and iOS and Android prefer IPv6. The
+phone resolves the printer to that IPv6 address, finds nothing listening, and
+the printer never shows up - or a job fails. From the Pi everything looks
+perfect:
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}' http://192.168.5.61:631/           # 200
+$ curl -s -o /dev/null -w '%{http_code}' 'http://[2409:8a04:...]:631/'      # 000
+```
+
+The fix is one extra line, and `verify_install` now checks for it explicitly:
+
+```
+Listen 0.0.0.0:631
+Listen [::]:631
+```
+
+```
+ok CUPS listening on IPv4 :631
+ok CUPS listening on IPv6 :631
+```
+
 ## Options
 
 ```
@@ -345,7 +378,24 @@ If the queue is still `disabled`, run `sudo cupsenable HP-LaserJet-P1007`; if
 that happens repeatedly, see the `usblp` section above.
 
 **Phone does not see the printer**
-Check that the hostname resolves to a LAN address, not a docker bridge:
+
+Work through these in order - each one looks fine until you check it:
+
+```bash
+# 1. is CUPS listening on BOTH families? (want 0.0.0.0:631 AND [::]:631)
+ss -tln | grep 631
+
+# 2. can the printer's IPv6 address actually be reached?
+curl -s -o /dev/null -w '%{http_code}\n' "http://[$(ip -6 addr show wlan0 | awk '/scope global/{print $2}' | cut -d/ -f1)]:631/"
+
+# 3. does the hostname resolve to a LAN address, not a docker bridge?
+avahi-resolve -n $(hostname).local        # want 192.168.x.y, NOT 172.17.0.1
+```
+
+If (1) shows only `0.0.0.0:631`, see section 7. If (3) resolves to `172.17.0.1`,
+see section 6. Re-running `sudo ./install.sh` fixes both.
+
+Also check that the hostname resolves to a LAN address, not a docker bridge:
 
 ```bash
 avahi-resolve -n $(hostname).local        # want 192.168.x.y, NOT 172.17.0.1
