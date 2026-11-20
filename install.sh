@@ -724,7 +724,7 @@ install_firmware_timer() {
     printf '  [dry-run] write /etc/systemd/system/printer-firmware-refresh.timer\n'
   else
     cat >"$recover" <<'RECOVEREOF'
-#!/bin/sh
+#!/bin/bash
 # Installed by usb-printer-airprint (install.sh).
 #
 # Keeps the host-based P1007 usable:
@@ -733,10 +733,10 @@ install_firmware_timer() {
 #   3. revive the CUPS queue after a power cycle,
 #   4. when software cannot fix it, SAY SO instead of hanging forever.
 #
-# Every device operation below is bounded by a timeout. An unbounded write to a
-# wedged printer is what turns "firmware went missing" into a total deadlock:
-# the stuck process keeps the USB device claimed, so every later job and every
-# later firmware upload hangs as well.
+# NOTE: bash, not sh. This script uses [[ ]] and local, which dash does not
+# support; under /bin/sh the test on line ~49 silently fails, printer_online()
+# always reports "not connected", and the watchdog exits every time without
+# doing anything - a dead watchdog that looks healthy in systemctl.
 set -u
 
 QUEUE="__QUEUE__"
@@ -959,6 +959,27 @@ TIMEREOF
   run systemctl enable --now printer-firmware-refresh.timer
   run_soft systemctl start printer-firmware-refresh.service
   ok "printer watchdog active"
+
+  # A watchdog that runs but silently does nothing is worse than no watchdog:
+  # systemctl reports it healthy while nothing is actually being checked. The
+  # interpreter mismatch that caused this (#!/bin/sh with [[ ]]) produced no
+  # failure status, so smoke-test the script itself.
+  if [[ $DRY_RUN -eq 0 && -f "$recover" ]]; then
+    if ! bash -n "$recover" 2>/dev/null; then
+      die "$recover has a syntax error"
+    fi
+    if ! bash "$recover" >/dev/null 2>"$recover.err"; then
+      warn "watchdog exited non-zero; see $recover.err"
+    fi
+    if [[ -s "$recover.err" ]]; then
+      warn "watchdog printed errors: $(head -1 "$recover.err")"
+      warn "  (an interpreter mismatch shows up here as '[[: not found')"
+      rm -f "$recover.err"
+    else
+      rm -f "$recover.err"
+      ok "watchdog runs cleanly"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
